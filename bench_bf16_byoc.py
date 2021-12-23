@@ -9,6 +9,8 @@ import mxnet as mx
 import gluoncv
 
 import warnings
+
+from tvm.relay.op.transform import repeat
 warnings.filterwarnings("ignore")
 import tvm
 from tvm.relay.op.contrib.dnnl import *
@@ -18,7 +20,6 @@ import numpy as np
 import os
 from tvm.contrib import utils
 from tvm.relay.build_module import bind_params_by_name
-from tvm.contrib import graph_executor
 from tvm.contrib.download import download_testdata
 from PIL import Image
 
@@ -65,7 +66,8 @@ class PrintIR:
     def run_before_pass(self, mod, info):
         print("Running pass: {}", info)
         print(mod)
-
+'''
+'''
 @relay.op.register_alter_op_layout("nn.conv2d", level=114)
 def alter_conv2d(attrs, inputs, tinfos, out_type):
     data, weight = inputs
@@ -135,17 +137,16 @@ def alter_conv2d(attrs, inputs, tinfos, out_type):
     new_attrs['kernel_layout'] = trans_data(weight_df, is_weight=True)
     new_attrs['out_layout'] = trans_data(dst_df, is_weight=False)
 
-    '''
-    IH = OH * SH - PH_L - PH_R + KH - 1
-    IW = OW * SW - PW_L - PW_R + KW - 1
-    data_shape = (N, IC, IH, IW)
-    print('[AlterConvLayout]-data: shape: {}, layout: old: {}, query: {}, new: {}'.format(
-        data_shape, attrs['data_layout'], src_df, new_attrs['data_layout']))
-    print('[AlterConvLayout]-weight: shape: {}, layout: old: {}, query: {}, new: {}'.format(
-        get_shape(weight), attrs['kernel_layout'], weight_df, new_attrs['kernel_layout']))
-    print('[AlterConvLayout]-out: shape: {}, layout: old: {}, query: {}, new: {}'.format(
-        get_shape(out_type), attrs['out_layout'], dst_df, new_attrs['out_layout']))
-    '''
+    if False:
+        IH = OH * SH - PH_L - PH_R + KH - 1
+        IW = OW * SW - PW_L - PW_R + KW - 1
+        data_shape = (N, IC, IH, IW)
+        print('[AlterConvLayout]-data: shape: {}, layout: old: {}, query: {}, new: {}'.format(
+            data_shape, attrs['data_layout'], src_df, new_attrs['data_layout']))
+        print('[AlterConvLayout]-weight: shape: {}, layout: old: {}, query: {}, new: {}'.format(
+            get_shape(weight), attrs['kernel_layout'], weight_df, new_attrs['kernel_layout']))
+        print('[AlterConvLayout]-out: shape: {}, layout: old: {}, query: {}, new: {}'.format(
+            get_shape(out_type), attrs['out_layout'], dst_df, new_attrs['out_layout']))
 
     return relay.nn.conv2d(data, weight, **new_attrs)
 
@@ -207,7 +208,12 @@ def np_bf16_cast_and_cast_back(arr):
     """Convert a numpy array of float to bf16 and cast back"""
     return np_bf162np_float(np_float2np_bf16(arr))
 
-def benchmark(network, batch_size, warmup=20, steps=100, target="llvm"):
+def benchmark(network, batch_size, warmup=20, repeat=5, steps=20, target="llvm", profiling=False):
+    
+    if profiling:
+        from tvm.contrib.debugger import debug_executor as graph_executor
+    else:
+        from tvm.contrib import graph_executor
     ctx = tvm.cpu()
     input_shape = (batch_size, 3, 224, 224)
     if network=="InceptionV3":
@@ -233,7 +239,7 @@ def benchmark(network, batch_size, warmup=20, steps=100, target="llvm"):
     out_fp32 = mxnet_output
     print("{}: mxnet-dnnl result[0:12]: \n{}".format(network, mxnet_output.flatten()[0:12]))
     
-    print("importing to fp32 mod ... ")
+    print("importing to fp32 graph ... ")
     mod_fp32, params = relay.frontend.from_mxnet(
         net, shape={"data": input_shape}, dtype="float32"
     )
@@ -242,7 +248,7 @@ def benchmark(network, batch_size, warmup=20, steps=100, target="llvm"):
         fout.write(mod_fp32.astext(show_meta_data=False))
     print("done")
 
-    print("converting to bf16 mod ... ")
+    print("converting to bf16 graph ... ")
     mod_bf16 = relay.transform.ToMixedPrecision('bfloat16')(mod_fp32)
     mod_bf16["main"] = bind_params_by_name(mod_bf16["main"], params)
     with open('mod_{}_bf16.swift'.format(network), 'w') as fout:
@@ -250,72 +256,100 @@ def benchmark(network, batch_size, warmup=20, steps=100, target="llvm"):
     print("done")
 
     '''
-    print("building fp32 lib ...")
+    print("building fp32-tvm lib ...")
     with tvm.transform.PassContext(opt_level=3):
-        lib_fp32 = relay.build(mod_fp32, target, params=params)
-    print("running fp32 module ...")
-    module_fp32 = graph_executor.GraphModule(lib_fp32["default"](dev))
-    module_fp32.set_input("data", input_data)
-    for i in range(steps+warmup):
-        if i == warmup:
-            tic = time.time()
-        module_fp32.run()
-    fp32_fps = steps * batch_size / (time.time() - tic)
-    print("{}: fp32 fps: {}".format(network, round(fp32_fps)))
-    out_fp32 = module_fp32.get_output(0, tvm.nd.empty(output_shape)).numpy()
-    print("{}: fp32 result[0:12]: \n{}".format(network, out_fp32.flatten()[0:12]))
-    print("{}: fp32 MSE:{}".format(network, np.square(np.subtract(out_fp32, mxnet_output)).mean()))
+        json_built, lib_built, params_built = relay.build(mod_fp32, target=target, params=params)
+    print("running fp32-tvm module ...")
+    module_runtime = graph_executor.create(json_built, lib_built, dev)
+    module_runtime.set_input("data", input_data, **params_built)
+    for i in range(warmup):
+        module_runtime.run()
+    perf_timer = module_runtime.benchmark(dev, "run", repeat=repeat, number=steps, min_repeat_ms=1000, end_to_end=True)
+    infer_times = np.array(perf_timer.results)
+    time_mean = np.mean(infer_times)
+    time_std = np.std(infer_times)
+    print("{}: fp32-tvm time: {}±{}ms".format(network, round(time_mean*1000), round(time_std*1000)))
+    fps_mean = 1/time_mean
+    fps_std = fps_mean*(time_std/time_mean)
+    print("{}: fp32-tvm fps: {}±{}".format(network, round(fps_mean), round(fps_std)))
+    if profiling:
+        print('Profiling results:')
+        print(module_runtime.profile())
+    output = module_runtime.get_output(0, tvm.nd.empty(output_shape)).numpy()
+    print('{}: fp32-tvm MSE: {}'.format(network, np.square(np.subtract(output, mxnet_output)).mean()))
+    print("{}: fp32-tvm result[0:12]: \n{}".format(network, output.flatten()[0:12]))
 
-    print("building bf16 lib ...")
+    print("building bf16-tvm lib ...")
     with tvm.transform.PassContext(opt_level=3):
-        lib_bf16 = relay.build(mod_bf16, target, params=params)
-    print("running bf16 module ...")
-    module_bf16 = graph_executor.GraphModule(lib_bf16["default"](dev))
-    module_bf16.set_input("data", input_data)
-    for i in range(steps+warmup):
-        if i == warmup:
-            tic = time.time()
-        module_bf16.run()
-    bf16_fps = steps * batch_size / (time.time() - tic)
-    print("{}: bf16 fps: {}".format(network, round(bf16_fps)))
-    out_bf16 = module_bf16.get_output(0, tvm.nd.empty(output_shape, "uint16")).numpy()
-    out_bf16 = np_bf162np_float(out_bf16).flatten()
-    print("{}: bf16 result[0:12]: \n{}".format(network, out_bf16.flatten()[0:12]))
-    print("{}: bf16 MSE:{}".format(network, np.square(np.subtract(out_bf16, mxnet_output)).mean()))
+        json_built, lib_built, params_built = relay.build(mod_bf16, target=target, params=params)
+    print("running bf16-tvm module ...")
+    module_runtime = graph_executor.create(json_built, lib_built, dev)
+    module_runtime.set_input("data", input_data, **params_built)
+    for i in range(warmup):
+        module_runtime.run()
+    perf_timer = module_runtime.benchmark(dev, "run", repeat=repeat, number=steps, min_repeat_ms=1000, end_to_end=True)
+    infer_times = np.array(perf_timer.results)
+    time_mean = np.mean(infer_times)
+    time_std = np.std(infer_times)
+    print("{}: bf16-tvm time: {}±{}ms".format(network, round(time_mean*1000), round(time_std*1000)))
+    fps_mean = 1/time_mean
+    fps_std = fps_mean*(time_std/time_mean)
+    print("{}: bf16-tvm fps: {}±{}".format(network, round(fps_mean), round(fps_std)))
+    if profiling:
+        print('Profiling results:')
+        print(module_runtime.profile())
+    output = module_runtime.get_output(0, tvm.nd.empty(output_shape, "uint16")).numpy()
+    output = np_bf162np_float(output).flatten()
+    print('{}: bf16-tvm MSE: {}'.format(network, np.square(np.subtract(output, mxnet_output)).mean()))
+    print("{}: bf16-tvm result[0:12]: \n{}".format(network, output.flatten()[0:12]))
+
     '''
-
     print("building fp32-dnnl lib ...")
     with tvm.transform.PassContext(opt_level=3):
-        lib_fp32_dnnl = relay.build(dnnl_seq(mod_fp32), target, params=params)
+        json_built, lib_built, params_built = relay.build(dnnl_seq(mod_fp32), target=target, params=params)
     print("running fp32-dnnl module ...")
-    module_fp32_dnnl = graph_executor.GraphModule(lib_fp32_dnnl["default"](dev))
-    module_fp32_dnnl.set_input("data", input_data)
-    for i in range(steps+warmup):
-        if i == warmup:
-            tic = time.time()
-        module_fp32_dnnl.run()
-    fp32_dnnl_fps = steps * batch_size / (time.time() - tic)
-    print("{}: fp32-dnnl fps: {}".format(network, round(fp32_dnnl_fps)))
-    out_fp32_dnnl = module_fp32_dnnl.get_output(0, tvm.nd.empty(output_shape)).numpy()
-    print("{}: fp32-dnnl result[0:12]: \n{}".format(network, out_fp32_dnnl.flatten()[0:12]))
-    print('{}: fp32-dnnl MSE: {}'.format(network, np.square(np.subtract(out_fp32_dnnl, mxnet_output)).mean()))
+    module_runtime = graph_executor.create(json_built, lib_built, dev)
+    module_runtime.set_input("data", input_data, **params_built)
+    for i in range(warmup):
+        module_runtime.run()
+    perf_timer = module_runtime.benchmark(dev, "run", repeat=repeat, number=steps, min_repeat_ms=1000, end_to_end=True)
+    infer_times = np.array(perf_timer.results)
+    time_mean = np.mean(infer_times)
+    time_std = np.std(infer_times)
+    print("{}: fp32-dnnl time: {}±{}ms".format(network, round(time_mean*1000), round(time_std*1000)))
+    fps_mean = 1/time_mean
+    fps_std = fps_mean*(time_std/time_mean)
+    print("{}: fp32-dnnl fps: {}±{}".format(network, round(fps_mean), round(fps_std)))
+    if profiling:
+        print('Profiling results:')
+        print(module_runtime.profile())
+    output = module_runtime.get_output(0, tvm.nd.empty(output_shape)).numpy()
+    print('{}: fp32-dnnl MSE: {}'.format(network, np.square(np.subtract(output, mxnet_output)).mean()))
+    print("{}: fp32-dnnl result[0:12]: \n{}".format(network, output.flatten()[0:12]))
 
     print("building bf16-dnnl lib ...")
     with tvm.transform.PassContext(opt_level=3):
-        lib_bf16_dnnl = relay.build(dnnl_seq(mod_bf16), target, params=params)
+        json_built, lib_built, params_built = relay.build(dnnl_seq(mod_bf16), target=target, params=params)
     print("running bf16-dnnl module ...")
-    module_bf16_dnnl = graph_executor.GraphModule(lib_bf16_dnnl["default"](dev))
-    module_bf16_dnnl.set_input("data", input_data)
-    for i in range(steps+warmup):
-        if i == warmup:
-            tic = time.time()
-        module_bf16_dnnl.run()
-    bf16_dnnl_fps = steps * batch_size / (time.time() - tic)
-    print("{}: bf16-dnnl fps: {}".format(network, round(bf16_dnnl_fps)))
-    out_bf16_dnnl = module_bf16_dnnl.get_output(0, tvm.nd.empty(output_shape, "uint16")).numpy()
-    out_bf16_dnnl = np_bf162np_float(out_bf16_dnnl).flatten()
-    print("{}: bf16-dnnl result[0:12]: \n{}".format(network, out_bf16_dnnl[0:12]))
-    print('{}: bf16-dnnl MSE: {}'.format(network, np.square(np.subtract(out_bf16_dnnl, mxnet_output)).mean()))
+    module_runtime = graph_executor.create(json_built, lib_built, dev)
+    module_runtime.set_input("data", input_data, **params_built)
+    for i in range(warmup):
+        module_runtime.run()
+    perf_timer = module_runtime.benchmark(dev, "run", repeat=repeat, number=steps, min_repeat_ms=1000, end_to_end=True)
+    infer_times = np.array(perf_timer.results)
+    time_mean = np.mean(infer_times)
+    time_std = np.std(infer_times)
+    print("{}: bf16-dnnl time: {}±{}ms".format(network, round(time_mean*1000), round(time_std*1000)))
+    fps_mean = 1/time_mean
+    fps_std = fps_mean*(time_std/time_mean)
+    print("{}: bf16-dnnl fps: {}±{}".format(network, round(fps_mean), round(fps_std)))
+    if profiling:
+        print('Profiling results:')
+        print(module_runtime.profile())
+    output = module_runtime.get_output(0, tvm.nd.empty(output_shape, "uint16")).numpy()
+    output = np_bf162np_float(output).flatten()
+    print('{}: bf16-dnnl MSE: {}'.format(network, np.square(np.subtract(output, mxnet_output)).mean()))
+    print("{}: bf16-dnnl result[0:12]: \n{}".format(network, output.flatten()[0:12]))
 
 if __name__ == "__main__":
     # os.environ["TVM_LOG_DEBUG"]="DEFAULT=1;ir/transform.cc=1;relay/ir/transform.cc=1"
@@ -340,7 +374,9 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", type=str, default="float32", help="The data type.")
 
     parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument("--repeat", type=int, default=5)
+    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--profiling", type=bool, default=False)
     args = parser.parse_args()
 
     if args.network == "all":
@@ -355,5 +391,5 @@ if __name__ == "__main__":
     target = tvm.target.Target(args.target)
 
     for network in networks:
-        benchmark(network, args.batch_size, \
-        warmup=args.warmup, steps=args.steps, target=args.target)
+        benchmark(network, args.batch_size, warmup=args.warmup, repeat=args.repeat, \
+            steps=args.steps, target=args.target, profiling=args.profiling)
