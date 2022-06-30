@@ -135,7 +135,6 @@ def benchmark(network, batch_size, warmup=20, repeat=5, steps=20, target="llvm",
         from tvm.contrib.debugger import debug_executor as graph_executor
     else:
         from tvm.contrib import graph_executor
-
     input_shape = (batch_size, 3, 224, 224)
     if network=="InceptionV3":
         input_shape = (batch_size, 3, 300, 300)
